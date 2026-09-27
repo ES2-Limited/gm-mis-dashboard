@@ -1,0 +1,35 @@
+# SPIN GM-MIS API host — serves the NestJS backend to the field mobile app.
+# Same backend (and database) the dashboard uses, exposed on its own subdomain.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ service_domain }};
+    return 301 https://$server_name$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {{ service_domain }};
+
+    # Cloudflare Origin Certificate (wildcard *.bayabotech.com)
+    ssl_certificate /etc/ssl/cloudflare/cert.pem;
+    ssl_certificate_key /etc/ssl/cloudflare/key.pem;
+
+    # Field photos/voice notes can be larger than the default 1m
+    client_max_body_size 15m;
+
+    add_header X-Content-Type-Options "nosniff" always;
+
+    location / {
+        proxy_pass http://127.0.0.1:{{ backend_port }};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+}

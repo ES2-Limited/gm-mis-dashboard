@@ -1,0 +1,131 @@
+---
+- name: Deploy SPIN GM-MIS Backend (NestJS API)
+  hosts: webservers
+  become: yes
+  vars:
+    api_name: spin-gm-mis-api
+    api_path: /var/www/spin-gm-mis-api
+    backend_src: "{{ playbook_dir }}/../../../gm-mis-backend"
+    backend_port: 3101
+    service_domain: spinservice.bayabotech.com
+    pm2: /usr/bin/pm2
+
+  tasks:
+    # ── ship the source (excluding node_modules/dist/.git/.env) ──
+    - name: Package backend source locally
+      delegate_to: localhost
+      become: no
+      command: >
+        tar -czf /tmp/{{ api_name }}.tgz -C {{ backend_src }}
+        --exclude=node_modules --exclude=dist --exclude=.git --exclude=.env .
+      changed_when: true
+
+    - name: Ensure app directory exists
+      file:
+        path: "{{ api_path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Upload backend source
+      copy:
+        src: /tmp/{{ api_name }}.tgz
+        dest: /tmp/{{ api_name }}.tgz
+
+    - name: Extract backend source
+      unarchive:
+        src: /tmp/{{ api_name }}.tgz
+        dest: "{{ api_path }}"
+        remote_src: yes
+
+    # ── production environment (DB, mail, JWT, DeepSeek, intake key) ──
+    - name: Write production .env
+      copy:
+        dest: "{{ api_path }}/.env"
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          DB_HOST=db-postgresql-lon1-55261-do-user-14219461-0.m.db.ondigitalocean.com
+          DB_PORT=25060
+          DB_USERNAME=doadmin
+          DB_PASSWORD={{ db_password }}
+          DB_DATABASE=spin
+          DB_SSL=true
+          JWT_SECRET={{ jwt_secret }}
+          SEED_PASSWORD={{ seed_password }}
+          SENDGRID_API_KEY={{ sendgrid_api_key }}
+          SENDGRID_FROM_EMAIL=business@bayabotech.com
+          SENDGRID_FROM_NAME=Spin Project
+          DEEPSEEK_API_KEY={{ deepseek_api_key }}
+          DEEPSEEK_MODEL=deepseek-chat
+          INTAKE_API_KEY={{ intake_api_key }}
+          PORT={{ backend_port }}
+          APP_URL=https://spin.bayabotech.com
+
+    # ── install + build ──
+    - name: Install dependencies (npm ci)
+      command: npm ci --no-audit --no-fund
+      args:
+        chdir: "{{ api_path }}"
+
+    - name: Build (nest build)
+      command: npm run build
+      args:
+        chdir: "{{ api_path }}"
+
+    # NOTE: database schema is already migrated (shared DigitalOcean Postgres).
+    # Migrations are not re-run here; run `npm run migration:run` manually if a
+    # new migration is added.
+
+    # ── run under pm2 (start or reload, then persist) ──
+    - name: Start or reload under pm2
+      shell: |
+        if {{ pm2 }} describe {{ api_name }} >/dev/null 2>&1; then
+          {{ pm2 }} restart {{ api_name }} --update-env
+        else
+          {{ pm2 }} start dist/main.js --name {{ api_name }} --cwd {{ api_path }}
+        fi
+        {{ pm2 }} save
+      args:
+        chdir: "{{ api_path }}"
+
+    # ── expose at spinservice.bayabotech.com ──
+    - name: Configure spinservice Nginx site
+      template:
+        src: templates/nginx-service.conf.j2
+        dest: /etc/nginx/sites-available/{{ api_name }}
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload Nginx
+
+    - name: Enable spinservice Nginx site
+      file:
+        src: /etc/nginx/sites-available/{{ api_name }}
+        dest: /etc/nginx/sites-enabled/{{ api_name }}
+        state: link
+      notify: Reload Nginx
+
+    - name: Test Nginx configuration
+      command: nginx -t
+      changed_when: false
+
+    - name: Wait for the API to come up
+      uri:
+        url: "http://127.0.0.1:{{ backend_port }}/api/auth/login"
+        method: POST
+        body_format: json
+        body: { email: "healthcheck", password: "x" }
+        status_code: [400, 401]
+      register: health
+      retries: 10
+      delay: 3
+      until: health.status is defined and health.status in [400, 401]
+
+  handlers:
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded

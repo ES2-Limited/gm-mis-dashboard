@@ -1,0 +1,121 @@
+---
+- name: Deploy SPIN GM-MIS Dashboard
+  hosts: webservers
+  become: yes
+  vars:
+    app_name: spin-gm-mis
+    domain_name: spin.bayabotech.com
+    app_path: /var/www/{{ app_name }}
+    dist_path: "{{ playbook_dir }}/../../dist"
+    # NestJS backend port (reverse-proxied at /api) — provisioned by backend.yml
+    backend_port: 3101
+    # Managed Insights key — injected server-side, never shipped to the browser.
+    # Provide via ansible-vault or env (e.g. -e @secrets.yml or export INSIGHTS_API_KEY=...).
+    insights_api_key: "{{ lookup('env', 'INSIGHTS_API_KEY') | default(omit, true) }}"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - nginx
+        state: present
+
+    # SSL — Cloudflare origin certificate (wildcard *.bayabotech.com)
+    - name: Create SSL directory for Cloudflare certificates
+      file:
+        path: /etc/ssl/cloudflare
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Copy SSL certificate
+      template:
+        src: templates/cert.pem.j2
+        dest: /etc/ssl/cloudflare/cert.pem
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Copy SSL private key
+      template:
+        src: templates/key.pem.j2
+        dest: /etc/ssl/cloudflare/key.pem
+        owner: root
+        group: root
+        mode: '0600'
+
+    # Static app deployment — dist/ is built locally by deploy.sh
+    - name: Verify local build exists
+      delegate_to: localhost
+      become: no
+      stat:
+        path: "{{ dist_path }}/index.html"
+      register: dist_check
+
+    - name: Fail if the app has not been built
+      fail:
+        msg: "dist/ not found — run 'npm run build' first (deploy.sh does this for you)"
+      when: not dist_check.stat.exists
+
+    # Atomic release: upload to a staging dir, then swap — an interrupted
+    # deploy can never leave the live site half-written.
+    - name: Create staging directory
+      file:
+        path: "{{ app_path }}.new"
+        state: absent
+
+    - name: Upload built application (staging)
+      copy:
+        src: "{{ dist_path }}/"
+        dest: "{{ app_path }}.new/"
+        owner: www-data
+        group: www-data
+        mode: '0644'
+        directory_mode: '0755'
+
+    - name: Swap release into place
+      shell: |
+        rm -rf {{ app_path }}.old
+        if [ -d {{ app_path }} ]; then mv {{ app_path }} {{ app_path }}.old; fi
+        mv {{ app_path }}.new {{ app_path }}
+        rm -rf {{ app_path }}.old
+
+    # Nginx
+    - name: Configure Nginx site
+      template:
+        src: templates/nginx.conf.j2
+        dest: /etc/nginx/sites-available/{{ app_name }}
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload Nginx
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/{{ app_name }}
+        dest: /etc/nginx/sites-enabled/{{ app_name }}
+        state: link
+      notify: Reload Nginx
+
+    - name: Test Nginx configuration
+      command: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Ensure Nginx is running
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
