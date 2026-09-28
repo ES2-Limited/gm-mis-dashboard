@@ -1,6 +1,6 @@
 
 
-const BASE = '/api'
+const BASE = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/$/, '')
 const TOKEN_KEY = 'spin.token'
 const REFRESH_KEY = 'spin.refresh'
 
